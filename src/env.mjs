@@ -1,8 +1,8 @@
 import path from "node:path";
 import dotenv from "dotenv";
 
-export function loadEnv(rootDir = process.cwd(), env = process.env) {
-  dotenv.config({ path: path.join(rootDir, ".env"), override: false, quiet: true });
+export function loadEnv(rootDir = process.cwd(), env = process.env, { readDotenv = env === process.env } = {}) {
+  if (readDotenv) dotenv.config({ path: path.join(rootDir, ".env"), override: false, quiet: true });
   const username = env.eufy_email;
   const password = env.eufy_pass;
   const missing = [];

@@ -67,9 +67,14 @@ server.registerTool(
   {
     title: "Discover Eufy Locks",
     description: "Authenticate with Eufy and list discovered smart locks with capability flags.",
-    inputSchema: {}
+    inputSchema: {
+      includeLocationMetadata: z
+        .boolean()
+        .optional()
+        .describe("Include Eufy house labels in the response. Defaults to false for privacy.")
+    }
   },
-  async () => response(await handlers.discover_locks())
+  async (input) => response(await handlers.discover_locks(input))
 );
 
 server.registerTool(

@@ -1,6 +1,6 @@
 # eufy-lock-codes
 
-`eufy-lock-codes` is a local MCP server for managing Eufy smart-lock access codes across rental properties. It is designed for real operations: code changes are planned first, write operations require explicit confirmation, passcodes are redacted in normal output, and successful writes are recorded in a private local escrow so future rotations do not depend on Eufy returning plaintext.
+`eufy-lock-codes` is a local MCP server for managing Eufy smart-lock access codes across rental properties. It is designed for real operations: code changes are planned first, write operations require explicit confirmation, stored plans are redacted, and successful writes are recorded in a private local escrow so future rotations do not depend on Eufy returning plaintext.
 
 The system uses the unofficial [`eufy-security-client`](https://github.com/bropat/eufy-security-client) package. Eufy does not provide a stable public smart-lock API, so this project keeps the Eufy integration behind a backend adapter and treats live verification as a maintainer gate.
 
@@ -10,7 +10,8 @@ The system uses the unofficial [`eufy-security-client`](https://github.com/bropa
 - Lists lock-code users and passcode metadata for one lock, one property, or all configured properties.
 - Creates dry-run plans for creating, updating, deleting, and rotating codes.
 - Executes exactly one unexpired confirmation token.
-- Waits for Eufy user-event acknowledgments before treating writes as successful.
+- Atomically claims confirmation tokens so one pending plan cannot be executed twice.
+- Waits for Eufy user-event acknowledgments, then verifies final user-list state.
 - Stores locally created or updated plaintext passcodes in ignored private escrow.
 - Writes redacted audit logs and live-test backups under ignored local state.
 
@@ -20,9 +21,11 @@ It never performs lock or unlock commands.
 
 - Write operations require a plan first, then `execute_plan`.
 - Plans expire and cannot be reused after execution.
+- Pending plan files contain masked operations. Plaintext needed for execution is stored separately under ignored local state, deleted when a plan is claimed, and cleaned during expiry maintenance.
 - Public tool responses and audit logs mask passcodes.
 - Ambiguous usernames, missing mappings, unsupported locks, and failed list calls are hard stops.
 - Rotation creates or updates the replacement before deleting an old user when the username changes.
+- If a later operation fails after new users were created, the executor attempts to delete those newly created users to avoid leaving extra active access.
 - Live verification scripts require `--yes-live-write` or `EUFY_CONFIRM_LIVE_WRITE=1`.
 
 ## Architecture
@@ -30,7 +33,7 @@ It never performs lock or unlock commands.
 - `mcp/server.mjs` exposes MCP tools over stdio.
 - `src/tools.mjs` implements planning, target resolution, safety checks, and execution.
 - `src/backend/eufy-adapter.mjs` isolates the unofficial Eufy client and waits for user-event acknowledgments.
-- `src/plan-store.mjs` persists pending plans and redacted audit records under `data/`.
+- `src/plan-store.mjs` persists redacted plans, short-lived pending secrets, expiry cleanup, and redacted audit records under `data/`.
 - `src/escrow.mjs` stores plaintext for locally created or updated codes under ignored local state.
 - `src/recovery-cache.mjs` can merge previously recovered local inventory into masked list responses when private recovery files exist.
 
@@ -96,6 +99,12 @@ Run local checks:
 npm run check
 ```
 
+Run test coverage:
+
+```bash
+npm run coverage
+```
+
 Run a read-only Eufy smoke check with real local credentials:
 
 ```bash
@@ -125,8 +134,11 @@ The live test creates and removes temporary users, creates and removes one sched
 
 - Eufy smart-lock APIs are unofficial and can drift.
 - Existing plaintext PINs are not always available from Eufy cloud responses.
+- Passcode value verification is limited by what Eufy returns; writes are verified through acknowledgements, final user-list state, and local escrow.
 - Offline or low-battery locks may not answer live P2P/read operations.
 - Production use should keep local backups and use a designated live verification lock after backend changes.
+
+See [docs/threat-model.md](docs/threat-model.md) and [docs/verification.md](docs/verification.md) for the safety assumptions and maintainer verification gate.
 
 ## License
 

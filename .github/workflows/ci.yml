@@ -15,6 +15,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm run coverage
       - run: npm run demo
       - run: npm run validate:mcp
       - run: npm audit --audit-level=moderate

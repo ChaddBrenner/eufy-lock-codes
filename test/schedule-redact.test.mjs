@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeSchedule, toBackendSchedule } from "../src/schedule.mjs";
-import { maskPasscode, redact } from "../src/redact.mjs";
+import { maskPasscode, redact, safeError } from "../src/redact.mjs";
 
 test("normalizeSchedule accepts aliases and weekday arrays", () => {
   const schedule = normalizeSchedule({
@@ -25,4 +25,20 @@ test("redaction masks passcodes and secret-ish keys", () => {
       eufy_pass: "[redacted]"
     }
   });
+});
+
+test("safeError redacts serials, emails, tokens, and labeled passcodes in messages", () => {
+  const error = new Error(
+    "Failed for user@example.com on T1234EXAMPLE99 with passcode=123456 and token gho_abcdefghijklmnop"
+  );
+  const result = safeError(error);
+
+  assert.equal(result.message.includes("chadd@example.com"), false);
+  assert.equal(result.message.includes("T1234EXAMPLE99"), false);
+  assert.equal(result.message.includes("123456"), false);
+  assert.equal(result.message.includes("gho_abcdefghijklmnop"), false);
+  assert.match(result.message, /\[redacted-email\]/);
+  assert.match(result.message, /\[redacted-serial\]/);
+  assert.match(result.message, /\[redacted-passcode\]/);
+  assert.match(result.message, /\[redacted-token\]/);
 });

@@ -56,11 +56,13 @@ export class MockBackend {
           ]
         }
       ]
-    }
+    },
+    fail = {}
   } = {}) {
     this.locks = locks;
     this.users = users;
     this.calls = [];
+    this.fail = fail;
   }
 
   async discoverLocks() {
@@ -73,18 +75,61 @@ export class MockBackend {
   }
 
   async addUser(deviceSN, username, passcode, schedule) {
+    if (this.fail.addUser) throw new Error(this.fail.addUser);
     this.calls.push({ method: "addUser", deviceSN, username, passcode, schedule });
+    const users = this.users[deviceSN] ?? [];
+    if (users.some((user) => user.username === username)) throw new Error(`User ${username} already exists`);
+    users.push({
+      username,
+      shortUserId: String(users.length + 1).padStart(4, "0"),
+      passcodes: [
+        {
+          passwordId: String(users.length + 1).padStart(4, "0"),
+          isPin: true,
+          plaintextPasscodeAvailable: false,
+          schedule
+        }
+      ]
+    });
+    this.users[deviceSN] = users;
   }
 
-  async deleteUser(deviceSN, username) {
+  #assertExpectedUser(user, expectedUser = {}) {
+    if (expectedUser.shortUserId && String(user.shortUserId) !== String(expectedUser.shortUserId)) {
+      throw new Error(`User ${user.username} identity changed`);
+    }
+    if (expectedUser.userId && String(user.userId) !== String(expectedUser.userId)) {
+      throw new Error(`User ${user.username} identity changed`);
+    }
+  }
+
+  async deleteUser(deviceSN, username, expectedUser) {
+    if (this.fail.deleteUser) throw new Error(this.fail.deleteUser);
+    const users = this.users[deviceSN] ?? [];
+    const index = users.findIndex((user) => user.username === username);
+    if (index === -1) throw new Error(`User ${username} was not found`);
+    this.#assertExpectedUser(users[index], expectedUser);
     this.calls.push({ method: "deleteUser", deviceSN, username });
+    users.splice(index, 1);
   }
 
-  async updateUserPasscode(deviceSN, username, passcode) {
+  async updateUserPasscode(deviceSN, username, passcode, expectedUser) {
+    if (this.fail.updateUserPasscode) throw new Error(this.fail.updateUserPasscode);
+    const user = (this.users[deviceSN] ?? []).find((candidate) => candidate.username === username);
+    if (!user) throw new Error(`User ${username} was not found`);
+    this.#assertExpectedUser(user, expectedUser);
     this.calls.push({ method: "updateUserPasscode", deviceSN, username, passcode });
+    const passcodeEntry = user.passcodes?.[0] ?? {};
+    user.passcodes = [{ ...passcodeEntry, plaintextPasscodeAvailable: false }];
   }
 
-  async updateUserSchedule(deviceSN, username, schedule) {
+  async updateUserSchedule(deviceSN, username, schedule, expectedUser) {
+    if (this.fail.updateUserSchedule) throw new Error(this.fail.updateUserSchedule);
+    const user = (this.users[deviceSN] ?? []).find((candidate) => candidate.username === username);
+    if (!user) throw new Error(`User ${username} was not found`);
+    this.#assertExpectedUser(user, expectedUser);
     this.calls.push({ method: "updateUserSchedule", deviceSN, username, schedule });
+    const passcodeEntry = user.passcodes?.[0] ?? {};
+    user.passcodes = [{ ...passcodeEntry, schedule }];
   }
 }

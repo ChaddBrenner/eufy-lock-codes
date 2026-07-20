@@ -6,6 +6,7 @@
   "main": "mcp/server.mjs",
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "coverage": "node --experimental-test-coverage --test-coverage-lines=75 --test test/*.test.mjs",
     "demo": "node scripts/demo.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test:live": "node scripts/live-crud-test.mjs",

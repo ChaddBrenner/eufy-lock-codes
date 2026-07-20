@@ -1,5 +1,13 @@
 #!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createToolHandlers } from "../src/tools.mjs";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "eufy-lock-codes-demo-"));
+process.on("exit", () => fs.rmSync(tempRoot, { recursive: true, force: true }));
 
 class DemoBackend {
   constructor() {
@@ -60,8 +68,8 @@ class DemoBackend {
 const backend = new DemoBackend();
 const tools = createToolHandlers({
   backend,
-  rootDir: process.cwd(),
-  configPath: "config/properties.example.yaml"
+  rootDir: tempRoot,
+  configPath: path.join(repoRoot, "config", "properties.example.yaml")
 });
 
 const list = await tools.list_lock_codes({ property: "sample-property", lockAlias: "front" });
@@ -85,7 +93,7 @@ console.log(
       operationCount: plan.operationCount,
       passcodeReturnedInPublicPlan: JSON.stringify(plan).includes("246813"),
       backendWriteCallsDuringDryRun: backend.calls.length,
-      note: "Demo uses an in-memory backend. It proves dry-run behavior without Eufy credentials."
+      note: "Demo uses an in-memory backend and temp runtime state. It proves dry-run behavior without Eufy credentials."
     },
     null,
     2

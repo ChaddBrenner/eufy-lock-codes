@@ -2,7 +2,7 @@ import { loadEnv } from "./env.mjs";
 import { loadPropertyConfig, resolveTargets, listConfiguredLocks } from "./config.mjs";
 import { validatePasscode, publicOperation } from "./passcodes.mjs";
 import { normalizeSchedule } from "./schedule.mjs";
-import { createPlan, loadPlan, markPlan, publicPlan, appendAudit } from "./plan-store.mjs";
+import { claimPlan, cleanupExpiredPlans, createPlan, markPlan, publicPlan, appendAudit } from "./plan-store.mjs";
 import { safeError } from "./redact.mjs";
 import {
   mergeEscrowIntoUsers,
@@ -16,6 +16,12 @@ function exactUser(users, username, deviceSN) {
   const matches = users.filter((user) => user.username === username);
   if (matches.length === 0) throw new Error(`User ${username} was not found on lock ${deviceSN}`);
   if (matches.length > 1) throw new Error(`User ${username} is ambiguous on lock ${deviceSN}`);
+  return matches[0];
+}
+
+function findExactUser(users, username) {
+  const matches = users.filter((user) => user.username === username);
+  if (matches.length !== 1) return undefined;
   return matches[0];
 }
 
@@ -41,11 +47,26 @@ function targetForOperation(target) {
   };
 }
 
+function publicLock(lock, { includeLocationMetadata = false } = {}) {
+  return {
+    serial: lock.serial,
+    name: lock.name,
+    model: lock.model,
+    deviceType: lock.deviceType,
+    stationSerial: lock.stationSerial,
+    capabilities: lock.capabilities,
+    supportsCodeCrud: lock.supportsCodeCrud,
+    lockKinds: lock.lockKinds,
+    ...(includeLocationMetadata ? { eufyHouseName: lock.eufyHouseName } : {})
+  };
+}
+
 function targetSummary(targets) {
   return targets.map((target) => `${target.propertyAlias ?? "unmapped"}:${target.lockName} (${target.lockSerial})`);
 }
 
 async function getTargets({ backend, rootDir, configPath, input }) {
+  cleanupExpiredPlans(rootDir);
   const config = loadPropertyConfig(rootDir, configPath);
   const locks = await backend.discoverLocks();
   const targets = resolveTargets(input, config, locks);
@@ -54,6 +75,7 @@ async function getTargets({ backend, rootDir, configPath, input }) {
 }
 
 function makePlan(rootDir, { type, reason, summary, operations }) {
+  cleanupExpiredPlans(rootDir);
   const plan = createPlan(rootDir, {
     type,
     reason,
@@ -65,6 +87,15 @@ function makePlan(rootDir, { type, reason, summary, operations }) {
 
 function isScheduleUpdate(input) {
   return Object.prototype.hasOwnProperty.call(input, "schedule") && input.schedule !== undefined;
+}
+
+function normalizedScheduleOrUndefined(schedule, { requireFields = false } = {}) {
+  const normalized = normalizeSchedule(schedule);
+  if (normalized && Object.keys(normalized).length === 0) {
+    if (requireFields) throw new Error("schedule update must include at least one schedule field");
+    return undefined;
+  }
+  return normalized;
 }
 
 function buildCodePolicy(targets) {
@@ -93,17 +124,217 @@ function publicExecutionResult(plan, results) {
   };
 }
 
-export function createToolHandlers({ backend, rootDir = process.cwd(), configPath = "config/properties.local.yaml" }) {
+function hasScheduleMetadata(user) {
+  return (user?.passcodes ?? []).some((passcode) => {
+    if (Number(passcode.expirationTime) > 0) return true;
+    if (!passcode.schedule || typeof passcode.schedule !== "object") return false;
+    return Object.keys(passcode.schedule).length > 0;
+  });
+}
+
+function pinPasswordIds(user) {
+  return (user?.passcodes ?? [])
+    .filter((passcode) => passcode.isPin !== false)
+    .map((passcode) => passcode.passwordId)
+    .filter(Boolean)
+    .map(String);
+}
+
+function userIdentity(user) {
   return {
-    async discover_locks() {
+    ...(user?.shortUserId ? { shortUserId: String(user.shortUserId) } : {}),
+    ...(user?.userId ? { userId: String(user.userId) } : {})
+  };
+}
+
+function assertExpectedUser(user, operation) {
+  if (!operation.expectedUser) return;
+  if (
+    operation.expectedUser.shortUserId &&
+    String(user.shortUserId) !== String(operation.expectedUser.shortUserId)
+  ) {
+    throw new Error(`User ${operation.username} identity changed on lock ${operation.deviceSN}`);
+  }
+  if (operation.expectedUser.userId && String(user.userId) !== String(operation.expectedUser.userId)) {
+    throw new Error(`User ${operation.username} identity changed on lock ${operation.deviceSN}`);
+  }
+}
+
+function hexByte(value) {
+  return Number(value).toString(16).padStart(2, "0");
+}
+
+function expectedEufyDate(value) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  const year = date.getFullYear();
+  return `${hexByte(year & 0xff)}${hexByte(year >> 8)}${hexByte(date.getMonth() + 1)}${hexByte(date.getDate())}`;
+}
+
+function expectedEufyTime(value) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return `${hexByte(date.getHours())}${hexByte(date.getMinutes())}`;
+}
+
+function scheduleMatchesRequested(actual, requested) {
+  if (!actual || typeof actual !== "object" || !requested) return false;
+  const comparisons = [
+    ["startDay", expectedEufyDate(requested.startDateTime)],
+    ["endDay", expectedEufyDate(requested.endDateTime)],
+    ["startTime", expectedEufyTime(requested.startDateTime)],
+    ["endTime", expectedEufyTime(requested.endDateTime)]
+  ].filter(([, expected]) => expected);
+  if (comparisons.length === 0) return hasScheduleMetadata({ passcodes: [{ schedule: actual }] });
+  return comparisons.every(([field, expected]) => String(actual[field] ?? "").toLowerCase() === expected);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function verifyOperationAppliedOnce(backend, operation) {
+  const users = await backend.getLockUsers(operation.deviceSN);
+  const checkedAt = new Date().toISOString();
+  if (operation.type === "delete_code") {
+    if (findExactUser(users, operation.username)) {
+      throw new Error(`User ${operation.username} was still present on lock ${operation.deviceSN} after delete`);
+    }
+    return {
+      checkedAt,
+      userPresent: false
+    };
+  }
+
+  const user = exactUser(users, operation.username, operation.deviceSN);
+  assertExpectedUser(user, operation);
+  const verification = {
+    checkedAt,
+    userPresent: true,
+    passcodeMetadataCount: (user.passcodes ?? []).length
+  };
+  if (operation.schedule !== undefined) {
+    verification.scheduleMetadataPresent = hasScheduleMetadata(user);
+    if (!verification.scheduleMetadataPresent) {
+      throw new Error(`User ${operation.username} on lock ${operation.deviceSN} did not expose schedule metadata after update`);
+    }
+    verification.scheduleMatchesRequested = (user.passcodes ?? []).some((passcode) =>
+      scheduleMatchesRequested(passcode.schedule, operation.schedule)
+    );
+    if (!verification.scheduleMatchesRequested) {
+      throw new Error(`User ${operation.username} on lock ${operation.deviceSN} did not expose the requested schedule after update`);
+    }
+    verification.scheduleVerification = "requested-schedule-metadata-present";
+  }
+  if (operation.passcode !== undefined) {
+    verification.passcodeVerification = "acknowledgement-plus-final-user-presence";
+    if (operation.expectedPinPasswordIds?.length > 0) {
+      const actualPinIds = new Set(pinPasswordIds(user));
+      const matched = operation.expectedPinPasswordIds.some((passwordId) => actualPinIds.has(String(passwordId)));
+      if (!matched) {
+        throw new Error(`User ${operation.username} on lock ${operation.deviceSN} did not expose the expected PIN entry after update`);
+      }
+      verification.expectedPinEntryPresent = true;
+    }
+  }
+  return verification;
+}
+
+async function verifyOperationApplied(backend, operation, { timeoutMs = 45_000, intervalMs = 2_500 } = {}) {
+  const startedAt = Date.now();
+  let lastError;
+  while (Date.now() - startedAt <= timeoutMs) {
+    try {
+      return await verifyOperationAppliedOnce(backend, operation);
+    } catch (error) {
+      lastError = error;
+      await wait(intervalMs);
+    }
+  }
+  throw lastError ?? new Error(`Timed out verifying ${operation.type} for ${operation.username} on ${operation.deviceSN}`);
+}
+
+async function compensateCreatedUsers({ backend, rootDir, appliedCreates, results, planId, verificationOptions }) {
+  const compensations = [];
+  const created = [...appliedCreates].reverse();
+  const seen = new Set();
+  for (const operation of created) {
+    const key = `${operation.deviceSN}:${operation.username}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      await backend.deleteUser(operation.deviceSN, operation.username);
+      const verified = await verifyOperationApplied(
+        backend,
+        {
+          type: "delete_code",
+          deviceSN: operation.deviceSN,
+          username: operation.username
+        },
+        verificationOptions
+      );
+      const localEscrow = removeEscrowEntry(rootDir, operation, { planId, compensation: true });
+      compensations.push({
+        type: "delete_created_user",
+        deviceSN: operation.deviceSN,
+        username: operation.username,
+        status: "verified",
+        verification: verified,
+        localEscrow
+      });
+    } catch (error) {
+      try {
+        const verification = await verifyOperationApplied(
+          backend,
+          {
+            type: "delete_code",
+            deviceSN: operation.deviceSN,
+            username: operation.username
+          },
+          verificationOptions
+        );
+        const localEscrow = removeEscrowEntry(rootDir, operation, { planId, compensation: true });
+        compensations.push({
+          type: "delete_created_user",
+          deviceSN: operation.deviceSN,
+          username: operation.username,
+          status: "already_absent",
+          verification,
+          localEscrow,
+          originalError: safeError(error)
+        });
+      } catch {
+        compensations.push({
+          type: "delete_created_user",
+          deviceSN: operation.deviceSN,
+          username: operation.username,
+          status: "failed",
+          error: safeError(error)
+        });
+      }
+    }
+  }
+  return compensations;
+}
+
+export function createToolHandlers({
+  backend,
+  rootDir = process.cwd(),
+  configPath = "config/properties.local.yaml",
+  verification = {}
+}) {
+  return {
+    async discover_locks(input = {}) {
+      cleanupExpiredPlans(rootDir);
       const locks = await backend.discoverLocks();
       return {
         count: locks.length,
-        locks
+        locks: locks.map((lock) => publicLock(lock, input))
       };
     },
 
     async health_check() {
+      const cleanup = cleanupExpiredPlans(rootDir);
       const envStatus = loadEnv(rootDir);
       const config = loadPropertyConfig(rootDir, configPath);
       const configuredLocks = listConfiguredLocks(config);
@@ -121,7 +352,12 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
         backend: {
           ok: false
         },
-        mappedLocks: []
+        mappedLocks: [],
+        localMaintenance: {
+          expiredPlans: cleanup.expired,
+          interruptedPlans: cleanup.interrupted,
+          removedPendingSecrets: cleanup.removedSecrets
+        }
       };
 
       if (!envStatus.ok) return result;
@@ -136,7 +372,6 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
             propertyAlias: configured.propertyAlias,
             lockName: configured.lockName,
             lockSerial: configured.lockSerial,
-            eufyHouseName: discovered?.eufyHouseName,
             found: Boolean(discovered),
             capabilities: discovered?.capabilities
           };
@@ -144,6 +379,7 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
         result.ok =
           result.credentials.present &&
           result.backend.ok &&
+          configuredLocks.length > 0 &&
           result.mappedLocks.every((lock) => lock.found !== false);
       } catch (error) {
         result.backend = {
@@ -182,7 +418,7 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
       const reason = assertReason(input.reason);
       const { targets } = await getTargets({ backend, rootDir, configPath, input });
       const passcode = validatePasscode(input.passcode, buildCodePolicy(targets));
-      const schedule = normalizeSchedule(input.schedule);
+      const schedule = normalizedScheduleOrUndefined(input.schedule);
       const username = String(input.username ?? "").trim();
       if (!username) throw new Error("username is required");
 
@@ -214,9 +450,14 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
       const username = String(input.username ?? "").trim();
       if (!username) throw new Error("username is required");
       const hasPasscode = input.passcode !== undefined && input.passcode !== null && input.passcode !== "";
+      if (Object.prototype.hasOwnProperty.call(input, "schedule") && input.schedule === null) {
+        throw new Error("schedule cannot be null for an update; omit it to leave schedule unchanged");
+      }
       if (!hasPasscode && !isScheduleUpdate(input)) throw new Error("Provide passcode, schedule, or both");
       const passcode = hasPasscode ? validatePasscode(input.passcode, buildCodePolicy(targets)) : undefined;
-      const schedule = isScheduleUpdate(input) ? normalizeSchedule(input.schedule) : undefined;
+      const schedule = isScheduleUpdate(input)
+        ? normalizedScheduleOrUndefined(input.schedule, { requireFields: !hasPasscode })
+        : undefined;
 
       const operations = [];
       for (const target of targets) {
@@ -225,13 +466,15 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
           ...(schedule ? ["updateSchedule"] : [])
         ]);
         const users = await backend.getLockUsers(target.lockSerial);
-        exactUser(users, username, target.lockSerial);
+        const user = exactUser(users, username, target.lockSerial);
         operations.push({
           type: "update_code",
           ...targetForOperation(target),
           username,
           passcode,
           schedule,
+          expectedPinPasswordIds: passcode ? pinPasswordIds(user) : undefined,
+          expectedUser: userIdentity(user),
           reason
         });
       }
@@ -253,11 +496,12 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
       for (const target of targets) {
         requireCapabilities(target, ["deleteUser"]);
         const users = await backend.getLockUsers(target.lockSerial);
-        exactUser(users, username, target.lockSerial);
+        const user = exactUser(users, username, target.lockSerial);
         operations.push({
           type: "delete_code",
           ...targetForOperation(target),
           username,
+          expectedUser: userIdentity(user),
           reason
         });
       }
@@ -277,13 +521,13 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
       if (!oldUsername) throw new Error("oldUsername is required");
       if (!newUsername) throw new Error("newUsername is required");
       const passcode = validatePasscode(input.newPasscode ?? input.passcode, buildCodePolicy(targets));
-      const schedule = normalizeSchedule(input.schedule);
+      const schedule = normalizedScheduleOrUndefined(input.schedule);
 
       const operations = [];
       for (const target of targets) {
         requireCapabilities(target, oldUsername === newUsername ? ["updatePasscode"] : ["addUser", "deleteUser"]);
         const users = await backend.getLockUsers(target.lockSerial);
-        exactUser(users, oldUsername, target.lockSerial);
+        const oldUser = exactUser(users, oldUsername, target.lockSerial);
         if (newUsername === oldUsername) {
           operations.push({
             type: "update_code",
@@ -291,6 +535,8 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
             username: oldUsername,
             passcode,
             schedule,
+            expectedPinPasswordIds: pinPasswordIds(oldUser),
+            expectedUser: userIdentity(oldUser),
             reason
           });
         } else {
@@ -307,6 +553,7 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
             type: "delete_code",
             ...targetForOperation(target),
             username: oldUsername,
+            expectedUser: userIdentity(oldUser),
             reason
           });
         }
@@ -320,37 +567,57 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
     },
 
     async execute_plan(input) {
+      cleanupExpiredPlans(rootDir);
       const token = String(input.confirmationToken ?? input.token ?? "").trim();
       if (!token) throw new Error("confirmationToken is required");
-      const plan = loadPlan(rootDir, token);
+      const plan = claimPlan(rootDir, token);
       const results = [];
+      const appliedCreates = [];
 
       try {
         for (const operation of plan.operations) {
           let localEscrow;
           if (operation.type === "create_code") {
-            await backend.addUser(operation.deviceSN, operation.username, operation.passcode, operation.schedule);
+            try {
+              await backend.addUser(operation.deviceSN, operation.username, operation.passcode, operation.schedule);
+              appliedCreates.push(operation);
+            } catch (error) {
+              if (error?.mayHaveApplied) appliedCreates.push(operation);
+              throw error;
+            }
             localEscrow = upsertEscrowPasscode(rootDir, operation, { planId: plan.id });
           } else if (operation.type === "update_code") {
             if (operation.passcode !== undefined) {
-              await backend.updateUserPasscode(operation.deviceSN, operation.username, operation.passcode);
+              await backend.updateUserPasscode(
+                operation.deviceSN,
+                operation.username,
+                operation.passcode,
+                operation.expectedUser
+              );
               localEscrow = upsertEscrowPasscode(rootDir, operation, { planId: plan.id });
             }
             if (operation.schedule !== undefined) {
-              await backend.updateUserSchedule(operation.deviceSN, operation.username, operation.schedule);
+              await backend.updateUserSchedule(
+                operation.deviceSN,
+                operation.username,
+                operation.schedule,
+                operation.expectedUser
+              );
               localEscrow = updateEscrowSchedule(rootDir, operation, { planId: plan.id });
             }
           } else if (operation.type === "delete_code") {
-            await backend.deleteUser(operation.deviceSN, operation.username);
+            await backend.deleteUser(operation.deviceSN, operation.username, operation.expectedUser);
             localEscrow = removeEscrowEntry(rootDir, operation, { planId: plan.id });
           } else {
             throw new Error(`Unknown operation type: ${operation.type}`);
           }
+          const operationVerification = await verifyOperationApplied(backend, operation, verification);
           results.push({
             type: operation.type,
             deviceSN: operation.deviceSN,
             username: operation.username,
-            status: "sent",
+            status: "verified",
+            verification: operationVerification,
             localEscrow
           });
         }
@@ -358,10 +625,20 @@ export function createToolHandlers({ backend, rootDir = process.cwd(), configPat
         markPlan(rootDir, token, "executed", executionResult);
         return executionResult;
       } catch (error) {
+        const compensations = await compensateCreatedUsers({
+          backend,
+          rootDir,
+          appliedCreates,
+          results,
+          planId: plan.id,
+          verificationOptions: verification
+        });
         const failure = {
           status: "failed",
           error: safeError(error),
-          partialResults: results
+          partialResults: results,
+          compensations,
+          remediationRequired: compensations.some((item) => item.status === "failed") || results.length > 0
         };
         markPlan(rootDir, token, "failed", failure);
         appendAudit(rootDir, { action: "execute_failed", planId: plan.id, failure });

@@ -17,6 +17,8 @@ export function validatePasscode(passcode, policy = {}) {
 
 export function publicOperation(operation) {
   const clone = { ...operation };
+  delete clone.expectedPinPasswordIds;
+  delete clone.expectedUser;
   if (clone.passcode !== undefined) {
     clone.passcodeMasked = maskPasscode(clone.passcode);
     delete clone.passcode;

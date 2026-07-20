@@ -82,8 +82,7 @@ function buildHouseMap(houses = []) {
   for (const house of houses) {
     const houseInfo = {
       houseId: house.house_id,
-      houseName: house.house_name,
-      address: house.address
+      houseName: house.house_name
     };
     for (const device of house.devices ?? []) {
       if (device.device_sn) byDeviceSerial.set(device.device_sn, houseInfo);
@@ -181,6 +180,15 @@ function isPinPassword(entry) {
   return entry?.password_type === UserPasswordType.PIN || String(entry?.password_type) === String(UserPasswordType.PIN);
 }
 
+function assertExpectedUserIdentity(user, expectedUser = {}, deviceSN, username) {
+  if (expectedUser.shortUserId && String(user.short_user_id) !== String(expectedUser.shortUserId)) {
+    throw new Error(`User ${username} identity changed on lock ${deviceSN}`);
+  }
+  if (expectedUser.userId && String(user.user_id) !== String(expectedUser.userId)) {
+    throw new Error(`User ${username} identity changed on lock ${deviceSN}`);
+  }
+}
+
 export class EufyLockBackend {
   constructor({ rootDir = process.cwd(), env = process.env, clientFactory = EufySecurity.initialize } = {}) {
     this.rootDir = rootDir;
@@ -245,8 +253,11 @@ export class EufyLockBackend {
       const timer = setTimeout(() => {
         settle(
           reject,
-          new Error(
-            `${action} was sent for ${username} on ${deviceSN}, but no Eufy lock acknowledgment arrived within ${timeoutMs}ms`
+          Object.assign(
+            new Error(
+              `${action} was sent for ${username} on ${deviceSN}, but no Eufy lock acknowledgment arrived within ${timeoutMs}ms`
+            ),
+            { mayHaveApplied: true }
           )
         );
       }, timeoutMs);
@@ -289,9 +300,7 @@ export class EufyLockBackend {
         const house = houseBySerial.get(lock.serial) ?? houseBySerial.get(lock.stationSerial);
         return {
           ...lock,
-          eufyHouseId: house?.houseId,
-          eufyHouseName: house?.houseName,
-          eufyHouseAddress: house?.address
+          eufyHouseName: house?.houseName
         };
       })
       .filter((lock) => lock.serial);
@@ -321,7 +330,7 @@ export class EufyLockBackend {
     return response.data?.data?.user_password_list ?? [];
   }
 
-  async #lookupUserForWrite(deviceSN, username) {
+  async #lookupUserForWrite(deviceSN, username, expectedUser) {
     const client = await this.connect();
     const device = await client.getDevice(deviceSN);
     const stationSN = device.getStationSerial();
@@ -335,6 +344,7 @@ export class EufyLockBackend {
     if (matches.length === 0) throw new Error(`User ${username} was not found on lock ${deviceSN}`);
     if (matches.length > 1) throw new Error(`User ${username} is ambiguous on lock ${deviceSN}`);
     const user = matches[0];
+    assertExpectedUserIdentity(user, expectedUser, deviceSN, username);
     const pin = (user.password_list ?? []).find(isPinPassword);
     const station = await client.getStation(stationSN);
     return {
@@ -343,6 +353,7 @@ export class EufyLockBackend {
       station,
       username: user.user_name,
       shortUserId: user.short_user_id,
+      userId: user.user_id,
       passwordId: pin?.password_id
     };
   }
@@ -358,19 +369,19 @@ export class EufyLockBackend {
     });
   }
 
-  async deleteUser(deviceSN, username) {
-    const client = await this.connect();
+  async deleteUser(deviceSN, username, expectedUser) {
+    const user = await this.#lookupUserForWrite(deviceSN, username, expectedUser);
     await this.#withUserAck({
       deviceSN,
       username,
       successEvent: "user deleted",
       action: "deleteUser",
-      invoke: () => client.deleteUser(deviceSN, username)
+      invoke: () => user.station.deleteUser(user.device, user.username, user.shortUserId)
     });
   }
 
-  async updateUserPasscode(deviceSN, username, passcode) {
-    const user = await this.#lookupUserForWrite(deviceSN, username);
+  async updateUserPasscode(deviceSN, username, passcode, expectedUser) {
+    const user = await this.#lookupUserForWrite(deviceSN, username, expectedUser);
     if (!user.passwordId) throw new Error(`No PIN passcode entry found for user ${username} on lock ${deviceSN}`);
     await this.#withUserAck({
       deviceSN,
@@ -381,14 +392,14 @@ export class EufyLockBackend {
     });
   }
 
-  async updateUserSchedule(deviceSN, username, schedule) {
-    const client = await this.connect();
+  async updateUserSchedule(deviceSN, username, schedule, expectedUser) {
+    const user = await this.#lookupUserForWrite(deviceSN, username, expectedUser);
     await this.#withUserAck({
       deviceSN,
       username,
       successEvent: "user schedule updated",
       action: "updateUserSchedule",
-      invoke: () => client.updateUserSchedule(deviceSN, username, toBackendSchedule(schedule))
+      invoke: () => user.station.updateUserSchedule(user.device, user.username, user.shortUserId, toBackendSchedule(schedule))
     });
   }
 }
