@@ -1,0 +1,13 @@
+.env
+node_modules/
+.venv/
+data/
+persistent.json
+config/*.local.yaml
+config/*.local.yml
+config/*.local.json
+scripts/export-*.mjs
+scripts/probe-*.mjs
+scripts/write-readable-lock-report.mjs
+.DS_Store
+npm-debug.log*

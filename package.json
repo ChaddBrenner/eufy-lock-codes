@@ -1,0 +1,30 @@
+{
+  "name": "eufy-lock-codes",
+  "version": "0.1.0",
+  "description": "Local MCP server for safely planning and executing Eufy smart lock code changes.",
+  "type": "module",
+  "main": "mcp/server.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node scripts/demo.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test:live": "node scripts/live-crud-test.mjs",
+    "validate:mcp": "node scripts/validate-mcp.mjs",
+    "check": "npm test && npm run demo && npm run validate:mcp && npm audit --audit-level=moderate"
+  },
+  "keywords": [
+    "mcp",
+    "eufy",
+    "smart-locks",
+    "property-management"
+  ],
+  "author": "Chadd Brenner",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "eufy-security-client": "^4.1.1-1",
+    "js-yaml": "^5.2.1",
+    "zod": "^4.4.3"
+  }
+}

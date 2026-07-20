@@ -1,0 +1,13 @@
+# Copy to config/properties.local.yaml and fill with your real property aliases and lock serials.
+properties:
+  sample-property:
+    name: Sample Property
+    codePolicy:
+      minLength: 4
+      maxLength: 8
+      requireNumeric: true
+    locks:
+      - serial: T8500EXAMPLE
+        name: Front Door
+        aliases:
+          - front
