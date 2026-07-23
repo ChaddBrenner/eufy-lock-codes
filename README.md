@@ -1,6 +1,6 @@
 # eufy-lock-codes
 
-`eufy-lock-codes` is a local MCP server for managing Eufy smart-lock access codes across rental properties. It is designed for real operations: code changes are planned first, write operations require explicit confirmation, stored plans are redacted, and successful writes are recorded in a private local escrow so future rotations do not depend on Eufy returning plaintext.
+`eufy-lock-codes` is a local MCP server for managing Eufy smart-lock access codes across rental properties. It is designed for real operations: code changes are planned first, write operations require an explicit second step, stored plans are redacted, and successful writes are recorded in a private local escrow when Eufy does not return plaintext.
 
 The system uses the unofficial [`eufy-security-client`](https://github.com/bropat/eufy-security-client) package. Eufy does not provide a stable public smart-lock API, so this project keeps the Eufy integration behind a backend adapter and treats live verification as a maintainer gate.
 
