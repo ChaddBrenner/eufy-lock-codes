@@ -125,9 +125,15 @@ function publicExecutionSummary(result) {
 }
 
 async function saveArtifact(name, data) {
-  const outPath = path.join(rootDir, "data", "backups", `${name}-${stamp()}.json`);
-  await fs.mkdir(path.dirname(outPath), { recursive: true });
-  await fs.writeFile(outPath, JSON.stringify(data, null, 2), "utf8");
+  const backupDir = path.join(rootDir, "data", "backups");
+  const outPath = path.join(backupDir, `${name}-${stamp()}.json`);
+  await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+  await fs.chmod(backupDir, 0o700);
+  await fs.writeFile(outPath, JSON.stringify(data, null, 2), {
+    encoding: "utf8",
+    mode: 0o600
+  });
+  await fs.chmod(outPath, 0o600);
   return outPath;
 }
 
